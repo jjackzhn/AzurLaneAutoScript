@@ -28,6 +28,13 @@ class ProcessManager:
     def __init__(self, config_name: str = "alas") -> None:
         self.config_name = config_name
         self._renderable_queue: queue.Queue[ConsoleRenderable] = State.manager.Queue()
+        self._screenshot_queue = None
+        self._latest_screenshot = None
+        self._screenshot_lock = threading.Lock()
+        try:
+            self._screenshot_queue = State.manager.Queue(maxsize=1)
+        except Exception:
+            pass  # Preview transport is optional.
         self.renderables: List[ConsoleRenderable] = []
         self.renderables_max_length = 400
         self.renderables_reduce_length = 80
@@ -46,6 +53,7 @@ class ProcessManager:
                     func,
                     self._renderable_queue,
                     ev,
+                    self._screenshot_queue,
                 ),
             )
             self._process.start()
@@ -94,6 +102,16 @@ class ProcessManager:
                 self.renderables = self.renderables[self.renderables_reduce_length :]
         logger.info("End of log queue handler loop")
 
+    def get_screenshot(self):
+        """Cache the latest frame so all browser sessions can display it."""
+        with self._screenshot_lock:
+            try:
+                if self._screenshot_queue is not None:
+                    self._latest_screenshot = self._screenshot_queue.get_nowait()
+            except Exception:
+                pass  # Empty or disconnected queue: retain the previous frame.
+            return self._latest_screenshot
+
     @property
     def alive(self) -> bool:
         if self._process is not None:
@@ -132,7 +150,8 @@ class ProcessManager:
 
     @staticmethod
     def run_process(
-        config_name, func: str, q: queue.Queue, e: threading.Event = None
+        config_name, func: str, q: queue.Queue, e: threading.Event = None,
+        screenshot_q=None,
     ) -> None:
         parser = argparse.ArgumentParser()
         parser.add_argument(
@@ -154,6 +173,13 @@ class ProcessManager:
 
         # Remove fake PIL module, because subprocess will use it
         remove_fake_pil_module()
+
+        if screenshot_q is not None:
+            try:
+                from module.device.screenshot import set_webui_screenshot_queue
+                set_webui_screenshot_queue(screenshot_q)
+            except Exception:
+                pass  # Optional preview setup must not prevent worker startup.
 
         AzurLaneConfig.stop_event = e
         try:
@@ -181,6 +207,13 @@ class ProcessManager:
             logger.info(f"[{config_name}] exited. Reason: Finish\n")
         except Exception as e:
             logger.exception(e)
+        finally:
+            if screenshot_q is not None:
+                try:
+                    from module.device.screenshot import close_webui_screenshot_publisher
+                    close_webui_screenshot_publisher()
+                except Exception:
+                    pass  # Preview cleanup must not interfere with worker exit.
 
     @classmethod
     def running_instances(cls) -> List["ProcessManager"]:
