@@ -1,8 +1,10 @@
 import argparse
+import base64
 import json
 import queue
 import threading
 import time
+import uuid
 from datetime import datetime
 from functools import partial
 from typing import Dict, List, Optional
@@ -411,6 +413,8 @@ class AlasGUI(Frame):
     @use_scope("content", clear=True)
     def alas_overview(self) -> None:
         self.init_menu(name="Overview")
+        self._game_screen_id = "alas-game-screen-" + uuid.uuid4().hex
+        self._game_screen_frame = None
         self.set_title(t(f"Gui.MenuAlas.Overview"))
 
         put_scope("overview", [put_scope("schedulers"), put_scope("logs")])
@@ -425,6 +429,15 @@ class AlasGUI(Frame):
                     put_scope("scheduler_btn"),
                 ],
             )
+            put_scope(
+                "game_screen",
+                [
+                    put_html(
+                        f'<img id="{self._game_screen_id}" alt="Game Screen" '
+                        'style="display:none;width:100%;height:auto;" />'
+                    ),
+                ],
+            ).style("min-width:0;")
             put_scope(
                 "running",
                 [
@@ -495,8 +508,37 @@ class AlasGUI(Frame):
 
         self.task_handler.add(switch_scheduler.g(), 1, True)
         self.task_handler.add(switch_log_scroll.g(), 1, True)
+        self.task_handler.add(self.alas_update_screenshot_task, 1, True)
         self.task_handler.add(self.alas_update_overview_task, 10, True)
         self.task_handler.add(log.put_log(self.alas), 0.25, True)
+
+    def alas_update_screenshot_task(self) -> None:
+        if not self.visible or self.page != "Overview":
+            return
+        try:
+            image = self.alas.get_screenshot()
+            if image is None or image == self._game_screen_frame:
+                return
+            run_js(
+                """
+                const img = document.getElementById(image_id);
+                if (img) {
+                    const next = new Image();
+                    img.previewNext = next;
+                    next.onload = () => {
+                        if (!img.isConnected || img.previewNext !== next) return;
+                        img.src = next.src;
+                        img.style.display = "block";
+                    };
+                    next.src = "data:image/jpeg;base64," + encoded;
+                }
+                """,
+                image_id=self._game_screen_id,
+                encoded=base64.b64encode(image).decode("ascii"),
+            )
+            self._game_screen_frame = image
+        except Exception:
+            pass  # A disconnected browser or preview transport is non-fatal.
 
     def _init_alas_config_watcher(self) -> None:
         def put_queue(path, value):

@@ -1,4 +1,6 @@
 import os
+import queue
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -19,6 +21,110 @@ from module.device.method.scrcpy import Scrcpy
 from module.device.method.wsa import WSA
 from module.exception import RequestHumanTakeover, ScriptError
 from module.logger import logger
+
+
+class _ScreenshotPublisher:
+    """Coalesce captures locally and publish the newest frame at most once a second."""
+
+    def __init__(self, transport, interval=1.0):
+        self.transport = transport
+        self.interval = interval
+        self.condition = threading.Condition()
+        self.latest = None
+        self.sequence = 0
+        self.published = 0
+        self.stopping = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def submit(self, image):
+        with self.condition:
+            if not self.stopping:
+                # Capture backends return owned arrays; keep the frame alive without copying.
+                self.latest = image
+                self.sequence += 1
+                self.condition.notify()
+
+    def close(self, timeout=1.0):
+        with self.condition:
+            self.stopping = True
+            self.condition.notify()
+        self.thread.join(timeout=timeout)
+
+    def _run(self):
+        next_push = 0.0
+        while True:
+            with self.condition:
+                while True:
+                    if self.sequence == self.published:
+                        if self.stopping:
+                            return
+                        self.condition.wait()
+                        continue
+                    delay = next_push - time.monotonic()
+                    if delay > 0 and not self.stopping:
+                        self.condition.wait(delay)
+                        continue
+                    image, sequence = self.latest, self.sequence
+                    break
+            success = False
+            try:
+                # Screenshots are RGB; OpenCV's JPEG encoder expects BGR.
+                encoded_ok, encoded = cv2.imencode(
+                    '.jpg', cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                if encoded_ok:
+                    payload = encoded.tobytes()
+                    try:
+                        self.transport.put_nowait(payload)
+                    except queue.Full:
+                        try:
+                            self.transport.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self.transport.put_nowait(payload)
+                    success = True
+            except Exception:
+                pass  # Preview failures must never interrupt automation.
+            next_push = time.monotonic() + self.interval
+            with self.condition:
+                if success:
+                    self.published = sequence
+                    if self.sequence == sequence:
+                        self.latest = None
+                elif self.stopping:
+                    return  # Shutdown is best effort, with no unbounded retries.
+
+
+_webui_screenshot_publisher = None
+
+
+def set_webui_screenshot_queue(q):
+    """Configure the optional preview transport in this worker process."""
+    global _webui_screenshot_publisher
+    close_webui_screenshot_publisher()
+    if q is not None:
+        _webui_screenshot_publisher = _ScreenshotPublisher(q)
+
+
+def close_webui_screenshot_publisher(timeout=1.0):
+    """Flush the final capture on normal worker exit, with a bounded wait."""
+    global _webui_screenshot_publisher
+    publisher = _webui_screenshot_publisher
+    _webui_screenshot_publisher = None
+    if publisher is not None:
+        publisher.close(timeout)
+
+
+def _publish_webui_screenshot(image):
+    publisher = _webui_screenshot_publisher
+    if publisher is None or image is None:
+        return
+    try:
+        publisher.submit(image)
+    except Exception:
+        # A preview failure must never interrupt automation.
+        pass
 
 
 class Screenshot(Adb, WSA, DroidCast, AScreenCap, Scrcpy, NemuIpc, LDOpenGL):
@@ -77,6 +183,7 @@ class Screenshot(Adb, WSA, DroidCast, AScreenCap, Scrcpy, NemuIpc, LDOpenGL):
             else:
                 continue
 
+        _publish_webui_screenshot(self.image)
         return self.image
 
     @property
