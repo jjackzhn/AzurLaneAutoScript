@@ -384,6 +384,7 @@ pre.rich-traceback-code {
     display: grid;
 }
 
+#pywebio-scope-game_screen,
 #pywebio-scope-running,
 #pywebio-scope-pending,
 #pywebio-scope-waiting,
